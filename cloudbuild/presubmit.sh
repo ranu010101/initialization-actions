@@ -7,7 +7,7 @@ declare -a TESTS_TO_RUN
 
 configure_gcloud() {
   gcloud config set core/disable_prompts TRUE
-  gcloud config set compute/zone us-central1-f
+  gcloud config set compute/region us-central1
 }
 
 configure_gcloud_ssh_key() {
@@ -29,7 +29,7 @@ configure_gcloud_ssh_key() {
 initialize_git_repo() {
   rm -fr .git
   git init
-  
+
   git config user.email "ia-tests@presubmit.example.com"
   git config user.name "ia-tests"
 

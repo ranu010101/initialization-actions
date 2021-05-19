@@ -1,12 +1,17 @@
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["horovod.sh"])
+
 py_test(
-    name = "test_tony",
+    name = "test_horovod",
     size = "enormous",
-    srcs = ["test_tony.py"],
+    srcs = ["test_horovod.py"],
     data = [
-        "tony.sh",
-        "//gpu:install_gpu_driver.sh"
+        "horovod.sh",
+        "//gpu:install_gpu_driver.sh",
+        "scripts/verify_mxnet.py",
+        "scripts/verify_pytorch.py",
+        "scripts/verify_tensorflow.py",
     ],
     local = True,
     shard_count = 4,

@@ -53,6 +53,9 @@ class RapidsTestCase(DataprocTestCase):
     ("STANDARD", ["m", "w-0"], GPU_P100, "yarn"),
     ("STANDARD", ["m"], GPU_P100, "standalone"))
   def test_rapids_dask(self, configuration, machine_suffixes, accelerator, dask_runtime):
+    if self.getImageOs() == 'centos':
+      self.skipTest("Not supported in CentOS-based images")
+
     if self.getImageVersion() < pkg_resources.parse_version("2.0"):
       self.skipTest("Not supported in pre 2.0 images")
 
@@ -73,9 +76,14 @@ class RapidsTestCase(DataprocTestCase):
       self.verify_dask_instance("{}-{}".format(self.getClusterName(),
                                                machine_suffix))
 
-  @parameterized.parameters(("STANDARD", ["w-0"], GPU_P100))
+  @parameterized.parameters(
+    ("SINGLE", ["m"], GPU_P100),
+    ("STANDARD", ["w-0"], GPU_P100))
   def test_rapids_spark(self, configuration, machine_suffixes, accelerator):
-    if self.getImageVersion() < pkg_resources.parse_version("1.5"):
+    if self.getImageOs() == 'centos':
+      self.skipTest("Not supported in CentOS-based images")
+
+    if self.getImageVersion() <= pkg_resources.parse_version("1.4"):
       self.skipTest("Not supported in pre 1.5 images")
 
     optional_components = None
@@ -90,6 +98,7 @@ class RapidsTestCase(DataprocTestCase):
         optional_components=optional_components,
         metadata=metadata,
         machine_type="n1-standard-4",
+        master_accelerator=accelerator if configuration == "SINGLE" else None,
         worker_accelerator=accelerator,
         timeout_in_minutes=30)
 

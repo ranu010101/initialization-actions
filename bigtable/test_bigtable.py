@@ -10,6 +10,7 @@ Note:
     See: https://cloud.google.com/bigtable/docs/cbt-overview
 """
 import os
+import pkg_resources
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -26,6 +27,7 @@ class BigTableTestCase(DataprocTestCase):
         super().__init__(method_name)
         self.metadata = None
         self.db_name = None
+        self.bigtable_zone = "us-central1-f"
 
     def setUp(self):
         super().setUp()
@@ -38,7 +40,7 @@ class BigTableTestCase(DataprocTestCase):
             'gcloud bigtable instances create {}'
             ' --cluster {} --cluster-zone {}'
             ' --display-name={} --instance-type=DEVELOPMENT'.format(
-                self.db_name, self.db_name, self.ZONE, self.db_name))
+                self.db_name, self.db_name, self.bigtable_zone, self.db_name))
 
     def tearDown(self):
         super().tearDown()
@@ -66,6 +68,12 @@ class BigTableTestCase(DataprocTestCase):
         ("HA", ["m-0"]),
     )
     def test_bigtable(self, configuration, machine_suffixes):
+        if self.getImageOs() == 'centos':
+            self.skipTest("Not supported in CentOS-based images")
+
+        if self.getImageVersion() >= pkg_resources.parse_version("2.0"):
+            self.skipTest("Not supported in the 2.0+ images")
+
         self.createCluster(
             configuration, self.INIT_ACTIONS, metadata=self.metadata)
 

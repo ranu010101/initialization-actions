@@ -32,11 +32,12 @@ ROLE="$(/usr/share/google/get_metadata_value attributes/dataproc-role)"
 readonly ROLE
 
 # CUDA Version
-CUDA_VERSION=$(get_metadata_attribute 'cuda-version' '10.2')
+CUDA_VERSION=$(get_metadata_attribute 'cuda-version' '11.0')
 readonly CUDA_VERSION
 
 # Parameters for NVIDIA-provided Debian GPU driver
-readonly DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_URL='https://us.download.nvidia.com/XFree86/Linux-x86_64/455.23.04/NVIDIA-Linux-x86_64-455.23.04.run'
+readonly DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_VERSION='460.56'
+readonly DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_VERSION}.run"
 NVIDIA_DEBIAN_GPU_DRIVER_URL=$(get_metadata_attribute 'gpu-driver-url' "${DEFAULT_NVIDIA_DEBIAN_GPU_DRIVER_URL}")
 readonly NVIDIA_DEBIAN_GPU_DRIVER_URL
 
@@ -63,8 +64,13 @@ readonly NCCL_REPO_URL
 NCCL_VERSION=$(get_metadata_attribute 'nccl-version' '2.7.8')
 readonly NCCL_VERSION
 
+# Parameters for NVIDIA-provided CUDNN library
+readonly CUDNN_VERSION=$(get_metadata_attribute 'cudnn-version' '')
+readonly CUDNN_TARBALL="cudnn-${CUDA_VERSION}-linux-x64-v${CUDNN_VERSION}.tgz"
+readonly CUDNN_TARBALL_URL="http://developer.download.nvidia.com/compute/redist/cudnn/v${CUDNN_VERSION%.*}/${CUDNN_TARBALL}"
+
 # Whether to install NVIDIA-provided or OS-provided GPU driver
-GPU_DRIVER_PROVIDER=$(get_metadata_attribute 'gpu-driver-provider' 'OS')
+GPU_DRIVER_PROVIDER=$(get_metadata_attribute 'gpu-driver-provider' 'NVIDIA')
 readonly GPU_DRIVER_PROVIDER
 
 # Stackdriver GPU agent parameters
@@ -102,6 +108,37 @@ function install_nvidia_nccl() {
   local -r nccl_version="${NCCL_VERSION}-1+cuda${CUDA_VERSION}"
   execute_with_retries \
     "apt-get install -y --allow-unauthenticated libnccl2=${nccl_version} libnccl-dev=${nccl_version}"
+}
+
+function install_nvidia_cudnn() {
+  if [[ ${OS_NAME} == ubuntu ]]; then
+    local major_version
+    major_version="${CUDNN_VERSION%%.*}"
+    local cudnn_pkg_version
+    cudnn_pkg_version="${CUDNN_VERSION}-1+cuda${CUDA_VERSION}"
+    local -a packages
+    packages=(
+      "libcudnn${major_version}=${cudnn_pkg_version}"
+      "libcudnn${major_version}-dev=${cudnn_pkg_version}")
+    execute_with_retries \
+      "apt-get install -y --no-install-recommends ${packages[*]}"
+  else
+    local tmp_dir
+    tmp_dir=$(mktemp -d -t gpu-init-action-cudnn-XXXX)
+
+    curl -fSsL --retry-connrefused --retry 10 --retry-max-time 30 \
+      "${CUDNN_TARBALL_URL}" -o "${tmp_dir}/${CUDNN_TARBALL}"
+
+    tar -xzf "${tmp_dir}/${CUDNN_TARBALL}" -C /usr/local
+
+    cat <<'EOF' >>/etc/profile.d/cudnn.sh
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+EOF
+  fi
+
+  ldconfig
+
+  echo "NVIDIA cuDNN successfully installed for ${OS_NAME}."
 }
 
 # Install NVIDIA GPU driver provided by NVIDIA
@@ -243,7 +280,7 @@ EOF
   # Reload systemd manager configuration
   systemctl daemon-reload
   # Enable gpu-utilization-agent service
-  systemctl --now enable gpu-utilization-agent.service
+  systemctl --no-reload --now enable gpu-utilization-agent.service
 }
 
 function set_hadoop_property() {
@@ -257,11 +294,20 @@ function set_hadoop_property() {
 }
 
 function configure_yarn() {
+  if [[ ! -f ${HADOOP_CONF_DIR}/resource-types.xml ]]; then
+    printf '<?xml version="1.0" ?>\n<configuration/>' >"${HADOOP_CONF_DIR}/resource-types.xml"
+  fi
+  set_hadoop_property 'resource-types.xml' 'yarn.resource-types' 'yarn.io/gpu'
+
   set_hadoop_property 'capacity-scheduler.xml' \
     'yarn.scheduler.capacity.resource-calculator' \
     'org.apache.hadoop.yarn.util.resource.DominantResourceCalculator'
 
   set_hadoop_property 'yarn-site.xml' 'yarn.resource-types' 'yarn.io/gpu'
+}
+
+# This configuration should be applied only if GPU is attached to the node
+function configure_yarn_nodemanager() {
   set_hadoop_property 'yarn-site.xml' 'yarn.nodemanager.resource-plugins' 'yarn.io/gpu'
   set_hadoop_property 'yarn-site.xml' \
     'yarn.nodemanager.resource-plugins.gpu.allowed-gpu-devices' 'auto'
@@ -278,9 +324,10 @@ function configure_yarn() {
     'org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor'
   set_hadoop_property 'yarn-site.xml' 'yarn.nodemanager.linux-container-executor.group' 'yarn'
 
+  # Fix local dirs access permissions
   local yarn_local_dirs=()
   readarray -d ',' yarn_local_dirs < <(bdconfig get_property_value \
-    --configuration_file "/etc/hadoop/conf/yarn-site.xml" \
+    --configuration_file "${HADOOP_CONF_DIR}/yarn-site.xml" \
     --name "yarn.nodemanager.local-dirs" 2>/dev/null | tr -d '\n')
   chown yarn:yarn -R "${yarn_local_dirs[@]/,/}"
 }
@@ -296,7 +343,7 @@ function configure_gpu_exclusive_mode() {
 }
 
 function configure_gpu_isolation() {
-  # download GPU discovery script
+  # Download GPU discovery script
   local -r spark_gpu_script_dir='/usr/lib/spark/scripts/gpu'
   mkdir -p ${spark_gpu_script_dir}
   local -r gpu_resources_url=https://raw.githubusercontent.com/apache/spark/master/examples/src/main/scripts/getGpusResources.sh
@@ -305,8 +352,8 @@ function configure_gpu_isolation() {
   chmod a+rwx -R ${spark_gpu_script_dir}
 
   # enable GPU isolation
-  sed -i "s/yarn.nodemanager\.linux\-container\-executor\.group\=/yarn\.nodemanager\.linux\-container\-executor\.group\=yarn/g" /etc/hadoop/conf/container-executor.cfg
-  printf '\n[gpu]\nmodule.enabled=true\n[cgroups]\nroot=/sys/fs/cgroup\nyarn-hierarchy=yarn\n' >>/etc/hadoop/conf/container-executor.cfg
+  sed -i "s/yarn.nodemanager\.linux\-container\-executor\.group\=/yarn\.nodemanager\.linux\-container\-executor\.group\=yarn/g" "${HADOOP_CONF_DIR}/container-executor.cfg"
+  printf '\n[gpu]\nmodule.enabled=true\n[cgroups]\nroot=/sys/fs/cgroup\nyarn-hierarchy=yarn\n' >>"${HADOOP_CONF_DIR}/container-executor.cfg"
 
   chmod a+rwx -R /sys/fs/cgroup/cpu,cpuacct
   chmod a+rwx -R /sys/fs/cgroup/devices
@@ -322,15 +369,23 @@ function main() {
   execute_with_retries "apt-get update"
   execute_with_retries "apt-get install -y -q pciutils"
 
-  configure_gpu_isolation
+  # This configuration should be ran on all nodes
+  # regardless if they have attached GPUs
   configure_yarn
 
   # Detect NVIDIA GPU
   if (lspci | grep -q NVIDIA); then
+    configure_yarn_nodemanager
+    configure_gpu_isolation
+
     execute_with_retries "apt-get install -y -q 'linux-headers-$(uname -r)'"
+
     if [[ ${GPU_DRIVER_PROVIDER} == 'NVIDIA' ]]; then
       install_nvidia_gpu_driver
-      install_nvidia_nccl
+      if [[ -n ${CUDNN_VERSION} ]]; then
+        install_nvidia_nccl
+        install_nvidia_cudnn
+      fi
     elif [[ ${GPU_DRIVER_PROVIDER} == 'OS' ]]; then
       install_os_gpu_driver
     else
@@ -341,14 +396,15 @@ function main() {
     # Install GPU metrics collection in Stackdriver if needed
     if [[ ${INSTALL_GPU_AGENT} == true ]]; then
       install_gpu_agent
-      echo 'GPU agent successfully deployed.'
+      echo 'GPU metrics agent successfully deployed.'
     else
-      echo 'GPU metrics will not be installed.'
+      echo 'GPU metrics agent will not be installed.'
     fi
 
-    if [[ "${ROLE}" != "Master" ]]; then
-      configure_gpu_exclusive_mode
-    fi
+    configure_gpu_exclusive_mode
+  elif [[ "${ROLE}" == "Master" ]]; then
+    configure_yarn_nodemanager
+    configure_gpu_isolation
   fi
 }
 
